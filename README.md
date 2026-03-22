@@ -2,6 +2,14 @@
 
 A JAX/Flax implementation of an MNIST classifier where weights are geometrically constrained to the shapes of the digits 0-9.
 
+I put this together with the help of Gemini 3 in approximately 20 minutes.
+
+## Learned Weights
+
+<p align="center">
+  <img alt="Learned Weights" src="constrained_weights.png" width="100%" />
+</p>
+
 ## Overview
 
 The network's weights are partitioned into 10 groups. Each group is constrained to a non-convex 2D region (a "bold" digit) using:
