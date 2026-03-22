@@ -105,10 +105,11 @@ def sdf_7(p):
 
 # 8: Two loops (defined in test)
 def sdf_8(p):
-    top_outer = sd_circle(p, jnp.array([0.0, 0.45]), 0.35)
-    top_inner = sd_circle(p, jnp.array([0.0, 0.45]), 0.15)
-    bot_outer = sd_circle(p, jnp.array([0.0, -0.45]), 0.40)
-    bot_inner = sd_circle(p, jnp.array([0.0, -0.45]), 0.15)
+    # Adjust centers to make them touch/overlap
+    top_outer = sd_circle(p, jnp.array([0.0, 0.35]), 0.45)
+    top_inner = sd_circle(p, jnp.array([0.0, 0.35]), 0.15)
+    bot_outer = sd_circle(p, jnp.array([0.0, -0.35]), 0.50)
+    bot_inner = sd_circle(p, jnp.array([0.0, -0.35]), 0.15)
     
     top = difference(top_outer, top_inner)
     bot = difference(bot_outer, bot_inner)

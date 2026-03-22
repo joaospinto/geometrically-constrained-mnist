@@ -68,43 +68,95 @@ def create_train_state(rng, learning_rate):
     tx = optax.adam(learning_rate)
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
+def compute_repulsion(pairs, subset_size=256):
+    """
+    Computes a log-potential based repulsion: V = sum( -log(dist + eps) )
+    log potential has better long-range spreading properties.
+    """
+    n = pairs.shape[0]
+    # Simple slice is fast
+    subset = pairs[:subset_size]
+    
+    diff = subset[:, None, :] - subset[None, :, :]
+    dist_sq = jnp.sum(diff**2, axis=-1)
+    
+    eps = 1e-6
+    # Log-potential repulsion
+    repulsion = -0.5 * jnp.log(dist_sq + eps)
+    # mask diagonal
+    repulsion = repulsion * (1.0 - jnp.eye(subset.shape[0]))
+    return jnp.mean(repulsion)
+
+def compute_grid_coverage(pairs, sdf_fn, grid_size=16):
+    """
+    Encourages points to cover the entire SDF region by penalizing 'empty' grid cells.
+    Uses a smooth masking approach to stay JIT-friendly.
+    """
+    ticks = jnp.linspace(-1.0, 1.0, grid_size)
+    X, Y = jnp.meshgrid(ticks, ticks)
+    grid_points = jnp.stack([X, Y], axis=-1).reshape(-1, 2)
+    
+    # Smooth indicator: 1 if inside, 0 if outside
+    # Using sigmoid of -sdf to get 1 for sdf < 0
+    is_inside = jax.nn.sigmoid(-20.0 * sdf_fn(grid_points))
+    
+    subset_pairs = pairs[:512]
+    diff = grid_points[:, None, :] - subset_pairs[None, :, :]
+    dist_sq = jnp.sum(diff**2, axis=-1)
+    
+    # For each grid point, softmin of distances to weights
+    # If no weight is close, min_dist_sq will be large.
+    min_dist_sq = -0.1 * jnp.log(jnp.sum(jnp.exp(-10.0 * dist_sq), axis=-1) + 1e-6)
+    
+    # Only penalize 'inside' points
+    weighted_penalty = min_dist_sq * is_inside
+    return jnp.sum(weighted_penalty) / (jnp.sum(is_inside) + 1e-6)
+
 @jax.jit
 def train_step(state, batch, multipliers, mu, partition_groups):
-    """
-    state: TrainState
-    batch: (images, labels)
-    multipliers: list of 10 arrays
-    mu: scalar
-    partition_groups: list of 10 arrays of pair indices
-    """
     images, labels = batch
     
     def loss_fn(params):
-        # Task Loss
         logits = state.apply_fn({'params': params}, images)
         one_hot = jax.nn.one_hot(labels, 10)
         task_loss = optax.softmax_cross_entropy(logits, one_hot).mean()
         
-        # ALM Penalty
-        def constraints_wrapper(p):
-            flat = get_params_flat(p)
-            c_list = []
-            for k in range(10):
-                # Get pairs for digit k
-                pairs = gather_pairs(flat, partition_groups[k])
-                # Apply SDF
-                dist = DIGIT_SDFS[k](pairs)
-                c_list.append(dist)
-            return c_list
-            
-        penalty, _ = compute_alm_loss(params, multipliers, mu, constraints_wrapper)
+        flat = get_params_flat(params)
         
-        return task_loss + penalty, (task_loss, penalty)
+        total_penalty = 0.0
+        total_repulsion = 0.0
+        total_coverage = 0.0
+        
+        all_c_vals = []
+        for k in range(10):
+            pairs = gather_pairs(flat, partition_groups[k])
+            c_val = DIGIT_SDFS[k](pairs)
+            all_c_vals.append(c_val)
+            
+            # Repulsion (long-range spread)
+            total_repulsion += compute_repulsion(pairs, subset_size=256)
+            
+            # Coverage (fill the whole shape)
+            total_coverage += compute_grid_coverage(pairs, DIGIT_SDFS[k], grid_size=12)
+
+        # ALM Penalty Term
+        def penalty_element(c, lam):
+            shifted = jnp.maximum(0.0, lam + mu * c)
+            return (shifted**2 - lam**2) / (2 * mu)
+        
+        penalty_tree = jax.tree_util.tree_map(penalty_element, all_c_vals, multipliers)
+        penalty = jax.tree_util.tree_reduce(lambda x, y: x + jnp.sum(y), penalty_tree, 0.0)
+        
+        # Combined Geometric Loss
+        # Weights tuned for strong uniformity
+        geom_loss = 1e-2 * total_repulsion + 0.5 * total_coverage
+        
+        return task_loss + penalty + geom_loss, (task_loss, penalty, total_repulsion, total_coverage)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, (task_loss, penalty)), grads = grad_fn(state.params)
+    (total_loss, (task_loss, penalty, repulsion, coverage)), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
-    return state, total_loss, task_loss, penalty
+    return state, total_loss, task_loss, penalty, repulsion, coverage
 
 @jax.jit
 def update_multipliers_step(params, multipliers, mu, partition_groups):
@@ -150,7 +202,7 @@ def main():
     
     # 3. Training Loop
     batch_size = 128
-    epochs = 10
+    epochs = 20
     steps_per_epoch = len(train_images) // batch_size
     
     for epoch in range(epochs):
@@ -165,17 +217,21 @@ def main():
         epoch_loss = 0
         epoch_task = 0
         epoch_pen = 0
+        epoch_rep = 0
+        epoch_cov = 0
         
         for step in range(steps_per_epoch):
             start = step * batch_size
             end = start + batch_size
             batch = (train_images[start:end], train_labels[start:end])
             
-            state, loss, task, pen = train_step(state, batch, multipliers, mu, partition_groups)
+            state, loss, task, pen, rep, cov = train_step(state, batch, multipliers, mu, partition_groups)
             
             epoch_loss += loss
             epoch_task += task
             epoch_pen += pen
+            epoch_rep += rep
+            epoch_cov += cov
         
         # Update multipliers & mu at end of epoch
         multipliers, max_viol = update_multipliers_step(state.params, multipliers, mu, partition_groups)
@@ -186,9 +242,11 @@ def main():
         avg_loss = epoch_loss / steps_per_epoch
         avg_task = epoch_task / steps_per_epoch
         avg_pen = epoch_pen / steps_per_epoch
+        avg_rep = epoch_rep / steps_per_epoch
+        avg_cov = epoch_cov / steps_per_epoch
         
         print(f"Epoch {epoch+1}/{epochs} | "
-              f"Loss: {avg_loss:.4f} (Task: {avg_task:.4f}, Pen: {avg_pen:.4f}) | "
+              f"Loss: {avg_loss:.4f} (Task: {avg_task:.4f}, Pen: {avg_pen:.4f}, Rep: {avg_rep:.4f}, Cov: {avg_cov:.4f}) | "
               f"Max Viol: {max_viol:.4f} | Mu: {mu:.2f} | "
               f"Time: {time.time() - start_time:.2f}s")
 
