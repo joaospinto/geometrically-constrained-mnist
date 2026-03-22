@@ -62,55 +62,93 @@ def gather_pairs(flat_params, group_indices):
 
 # --- Training Logic ---
 
-def create_train_state(rng, learning_rate):
+def sample_uniform_in_sdf(sdf_fn, n_pairs, rng):
+    """
+    Sample points uniformly within the region where sdf_fn(p) < 0.
+    """
+    points = []
+    curr_rng = rng
+    while len(points) < n_pairs:
+        curr_rng, sub_rng = jax.random.split(curr_rng)
+        # Sample in bounding box [-1.2, 1.2]
+        candidates = jax.random.uniform(sub_rng, (n_pairs * 2, 2), minval=-1.2, maxval=1.2)
+        dists = sdf_fn(candidates)
+        inside = candidates[dists < 0]
+        points.append(inside)
+        n_collected = sum(p.shape[0] for p in points)
+        if n_collected >= n_pairs:
+            break
+            
+    all_points = jnp.concatenate(points, axis=0)
+    return all_points[:n_pairs]
+
+def create_train_state(rng, learning_rate, partition_groups):
     model = MLP()
-    params = model.init(rng, jnp.ones([1, 784]))['params']
+    # Dummy init to get structure
+    variables = model.init(rng, jnp.ones([1, 784]))
+    params = variables['params']
+    
+    # Re-initialize weights uniformly within their SDFs
+    flat_params = get_params_flat(params)
+    new_flat = np.array(flat_params) # Use numpy for item assignment then back to jax
+    
+    print("Initializing weights uniformly within digit shapes...")
+    init_rngs = jax.random.split(rng, 10)
+    for k in range(10):
+        indices = partition_groups[k]
+        n_pairs = indices.shape[0]
+        sampled_pairs = sample_uniform_in_sdf(DIGIT_SDFS[k], n_pairs, init_rngs[k])
+        
+        # Map back to flat_params
+        idx_0 = 2 * indices
+        idx_1 = 2 * indices + 1
+        new_flat[idx_0] = sampled_pairs[:, 0]
+        new_flat[idx_1] = sampled_pairs[:, 1]
+    
+    # Reconstruct PyTree
+    leaves, treedef = jax.tree_util.tree_flatten(params)
+    new_leaves = []
+    pointer = 0
+    for leaf in leaves:
+        size = leaf.size
+        new_leaves.append(jnp.array(new_flat[pointer:pointer+size]).reshape(leaf.shape))
+        pointer += size
+    new_params = jax.tree_util.tree_unflatten(treedef, new_leaves)
+    
     tx = optax.adam(learning_rate)
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    return train_state.TrainState.create(apply_fn=model.apply, params=new_params, tx=tx)
 
 def compute_repulsion(pairs, subset_size=256):
     """
-    Computes a log-potential based repulsion: V = sum( -log(dist + eps) )
-    log potential has better long-range spreading properties.
+    Stronger repulsion to prevent collapse.
     """
-    n = pairs.shape[0]
-    # Simple slice is fast
     subset = pairs[:subset_size]
-    
     diff = subset[:, None, :] - subset[None, :, :]
     dist_sq = jnp.sum(diff**2, axis=-1)
-    
-    eps = 1e-6
-    # Log-potential repulsion
-    repulsion = -0.5 * jnp.log(dist_sq + eps)
-    # mask diagonal
+    eps = 1e-5
+    # Stronger 1/dist^2 repulsion for local spacing
+    repulsion = 1.0 / (dist_sq + eps)
     repulsion = repulsion * (1.0 - jnp.eye(subset.shape[0]))
     return jnp.mean(repulsion)
 
-def compute_grid_coverage(pairs, sdf_fn, grid_size=16):
+def compute_grid_coverage(pairs, sdf_fn, grid_size=20):
     """
-    Encourages points to cover the entire SDF region by penalizing 'empty' grid cells.
-    Uses a smooth masking approach to stay JIT-friendly.
+    High-resolution grid coverage to ensure full shape occupancy.
     """
-    ticks = jnp.linspace(-1.0, 1.0, grid_size)
+    ticks = jnp.linspace(-1.1, 1.1, grid_size)
     X, Y = jnp.meshgrid(ticks, ticks)
     grid_points = jnp.stack([X, Y], axis=-1).reshape(-1, 2)
+    is_inside = jax.nn.sigmoid(-30.0 * sdf_fn(grid_points))
     
-    # Smooth indicator: 1 if inside, 0 if outside
-    # Using sigmoid of -sdf to get 1 for sdf < 0
-    is_inside = jax.nn.sigmoid(-20.0 * sdf_fn(grid_points))
-    
-    subset_pairs = pairs[:512]
+    # Check distance of every grid point to its nearest weight
+    # Subsampling pairs for speed but using more than before
+    subset_pairs = pairs[:1024]
     diff = grid_points[:, None, :] - subset_pairs[None, :, :]
     dist_sq = jnp.sum(diff**2, axis=-1)
     
-    # For each grid point, softmin of distances to weights
-    # If no weight is close, min_dist_sq will be large.
-    min_dist_sq = -0.1 * jnp.log(jnp.sum(jnp.exp(-10.0 * dist_sq), axis=-1) + 1e-6)
-    
-    # Only penalize 'inside' points
-    weighted_penalty = min_dist_sq * is_inside
-    return jnp.sum(weighted_penalty) / (jnp.sum(is_inside) + 1e-6)
+    # Penalty if nearest weight is far
+    min_dist_sq = -0.05 * jnp.log(jnp.sum(jnp.exp(-20.0 * dist_sq), axis=-1) + 1e-6)
+    return jnp.sum(min_dist_sq * is_inside) / (jnp.sum(is_inside) + 1e-6)
 
 @jax.jit
 def train_step(state, batch, multipliers, mu, partition_groups):
@@ -133,13 +171,9 @@ def train_step(state, batch, multipliers, mu, partition_groups):
             c_val = DIGIT_SDFS[k](pairs)
             all_c_vals.append(c_val)
             
-            # Repulsion (long-range spread)
             total_repulsion += compute_repulsion(pairs, subset_size=256)
-            
-            # Coverage (fill the whole shape)
-            total_coverage += compute_grid_coverage(pairs, DIGIT_SDFS[k], grid_size=12)
+            total_coverage += compute_grid_coverage(pairs, DIGIT_SDFS[k], grid_size=16)
 
-        # ALM Penalty Term
         def penalty_element(c, lam):
             shifted = jnp.maximum(0.0, lam + mu * c)
             return (shifted**2 - lam**2) / (2 * mu)
@@ -147,9 +181,8 @@ def train_step(state, batch, multipliers, mu, partition_groups):
         penalty_tree = jax.tree_util.tree_map(penalty_element, all_c_vals, multipliers)
         penalty = jax.tree_util.tree_reduce(lambda x, y: x + jnp.sum(y), penalty_tree, 0.0)
         
-        # Combined Geometric Loss
-        # Weights tuned for strong uniformity
-        geom_loss = 1e-2 * total_repulsion + 0.5 * total_coverage
+        # Significantly higher weights for geometry to fight task-loss collapse
+        geom_loss = 2e-3 * total_repulsion + 2.0 * total_coverage
         
         return task_loss + penalty + geom_loss, (task_loss, penalty, total_repulsion, total_coverage)
 
@@ -184,14 +217,18 @@ def main():
     rng, init_rng = jax.random.split(rng)
     
     learning_rate = 1e-3
-    state = create_train_state(init_rng, learning_rate)
     
     print("Partitioning weights...")
-    flat_params = get_params_flat(state.params)
-    n_params = flat_params.shape[0]
+    # Dummy params to get size
+    dummy_model = MLP()
+    dummy_params = dummy_model.init(rng, jnp.ones([1, 784]))['params']
+    flat_dummy = get_params_flat(dummy_params)
+    n_params = flat_dummy.shape[0]
     print(f"Total parameters: {n_params}")
     
     partition_groups = partition_indices(n_params, seed=42)
+    
+    state = create_train_state(init_rng, learning_rate, partition_groups)
     
     # Initialize multipliers (zeros)
     multipliers = []
