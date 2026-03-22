@@ -1,0 +1,19 @@
+[project]
+name = "jax-nn-mnist-constrained-weights"
+version = "0.1.0"
+description = "MNIST training with weights constrained to digit-shaped nonconvex polytopes using JAX and FLAX."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.0",
+    "jaxlib>=0.4.0",
+    "flax>=0.6.0",
+    "optax>=0.1.0",
+    "matplotlib>=3.5.0",
+    "numpy>=1.20.0",
+    "jax-metal; sys_platform == 'darwin'",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

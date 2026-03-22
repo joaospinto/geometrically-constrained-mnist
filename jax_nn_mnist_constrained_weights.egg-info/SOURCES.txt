@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+jax_nn_mnist_constrained_weights.egg-info/PKG-INFO
+jax_nn_mnist_constrained_weights.egg-info/SOURCES.txt
+jax_nn_mnist_constrained_weights.egg-info/dependency_links.txt
+jax_nn_mnist_constrained_weights.egg-info/requires.txt
+jax_nn_mnist_constrained_weights.egg-info/top_level.txt
